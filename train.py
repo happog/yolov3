@@ -6,7 +6,7 @@ from utils.datasets import *
 from utils.utils import *
 
 parser = argparse.ArgumentParser()
-parser.add_argument('-epochs', type=int, default=160, help='number of epochs')
+parser.add_argument('-epochs', type=int, default=68, help='number of epochs')
 parser.add_argument('-batch_size', type=int, default=12, help='size of each image batch')
 parser.add_argument('-data_config_path', type=str, default='cfg/coco.data', help='data config file path')
 parser.add_argument('-cfg', type=str, default='cfg/yolov3.cfg', help='cfg file path')
@@ -33,18 +33,18 @@ def main(opt):
     # Configure run
     data_config = parse_data_config(opt.data_config_path)
     num_classes = int(data_config['classes'])
-    if platform == 'darwin':  # macos
-        train_path = data_config['valid']
-    else:  # linux (gcp cloud)
+    if platform == 'darwin':  # MacOS (local)
+        train_path = data_config['train']
+    else:  # linux (cloud, i.e. gcp)
         train_path = '../coco/trainvalno5k.part'
 
     # Initialize model
     model = Darknet(opt.cfg, opt.img_size)
 
     # Get dataloader
-    dataloader = ListDataset(train_path, batch_size=opt.batch_size, img_size=opt.img_size)
+    dataloader = load_images_and_labels(train_path, batch_size=opt.batch_size, img_size=opt.img_size, augment=True)
 
-    # reload saved optimizer state
+    # Reload saved optimizer state
     start_epoch = 0
     best_loss = float('inf')
     if opt.resume:
@@ -56,22 +56,20 @@ def main(opt):
             model = nn.DataParallel(model)
         model.to(device).train()
 
-        # # Transfer learning
+        # # Transfer learning (train only YOLO layers)
         # for i, (name, p) in enumerate(model.named_parameters()):
-        #     #name = name.replace('module_list.', '')
-        #     #print('%4g %70s %9s %12g %20s %12g %12g' % (
-        #     #    i, name, p.requires_grad, p.numel(), list(p.shape), p.mean(), p.std()))
         #     if p.shape[0] != 650:  # not YOLO layer
         #         p.requires_grad = False
 
         # Set optimizer
-        # optimizer = torch.optim.SGD(model.parameters(), lr=.001, momentum=.9, weight_decay=0.0005 * 0, nesterov=True)
         # optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()))
-        optimizer = torch.optim.Adam(model.parameters())
-        optimizer.load_state_dict(checkpoint['optimizer'])
+        optimizer = torch.optim.SGD(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3,
+                                    momentum=.9, weight_decay=5e-4, nesterov=True)
 
         start_epoch = checkpoint['epoch'] + 1
-        best_loss = checkpoint['best_loss']
+        if checkpoint['optimizer'] is not None:
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            best_loss = checkpoint['best_loss']
 
         del checkpoint  # current, saved
     else:
@@ -79,90 +77,94 @@ def main(opt):
             print('Using ', torch.cuda.device_count(), ' GPUs')
             model = nn.DataParallel(model)
         model.to(device).train()
-        optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4, weight_decay=5e-4)
+
+        # Set optimizer
+        # optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=5e-4)
+        optimizer = torch.optim.SGD(model.parameters(), lr=1e-3, momentum=.9, weight_decay=5e-4, nesterov=True)
 
     # Set scheduler
-    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, 24, eta_min=0.00001, last_epoch=-1)
-    # y = 0.001 * exp(-0.00921 * x)  # 1e-4 @ 250, 1e-5 @ 500
-    # scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99082, last_epoch=start_epoch - 1)
+    # scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[54, 61], gamma=0.1)
 
     modelinfo(model)
     t0, t1 = time.time(), time.time()
     print('%10s' * 16 % (
-        'Epoch', 'Batch', 'x', 'y', 'w', 'h', 'conf', 'cls', 'total', 'P', 'R', 'nGT', 'TP', 'FP', 'FN', 'time'))
+        'Epoch', 'Batch', 'x', 'y', 'w', 'h', 'conf', 'cls', 'total', 'P', 'R', 'nTargets', 'TP', 'FP', 'FN', 'time'))
     for epoch in range(opt.epochs):
         epoch += start_epoch
 
-        # img_size = random.choice(range(10, 20)) * 32
-        # dataloader = ListDataset(train_path, batch_size=opt.batch_size, img_size=img_size)
-        # print('Running image size %g' % img_size)
+        # Multi-Scale YOLO Training
+        # img_size = random.choice(range(10, 20)) * 32  # 320 - 608 pixels
+        # dataloader = load_images_and_labels(train_path, batch_size=opt.batch_size, img_size=img_size, augment=True)
+        # print('Running this epoch with image size %g' % img_size)
 
-        # Update scheduler
-        # if epoch % 25 == 0:
-        #     scheduler.last_epoch = -1  # for cosine annealing, restart every 25 epochs
+        # Update scheduler (automatic)
         # scheduler.step()
-        # if epoch <= 100:
-        # for g in optimizer.param_groups:
-        # g['lr'] = 0.0005 * (0.992 ** epoch)  # 1/10 th every 250 epochs
-        # g['lr'] = 0.001 * (0.9773 ** epoch)  # 1/10 th every 100 epochs
-        # g['lr'] = 0.0005 * (0.955 ** epoch)  # 1/10 th every 50 epochs
-        # g['lr'] = 0.0005 * (0.926 ** epoch)  # 1/10 th every 30 epochs
+
+        # Update scheduler (manual)
+        if epoch < 54:
+            lr = 1e-3
+        elif epoch < 61:
+            lr = 1e-4
+        else:
+            lr = 1e-5
+        for g in optimizer.param_groups:
+            g['lr'] = lr
 
         ui = -1
         rloss = defaultdict(float)  # running loss
         metrics = torch.zeros(4, num_classes)
         for i, (imgs, targets) in enumerate(dataloader):
+            if sum([len(x) for x in targets]) < 1:  # if no targets continue
+                continue
 
-            n = opt.batch_size  # number of pictures at a time
-            for j in range(int(len(imgs) / n)):
-                targets_j = targets[j * n:j * n + n]
-                nGT = sum([len(x) for x in targets_j])
-                if nGT < 1:
-                    continue
+            # SGD burn-in
+            if (epoch == 0) & (i <= 1000):
+                lr = 1e-3 * (i / 1000) ** 4
+                for g in optimizer.param_groups:
+                    g['lr'] = lr
 
-                loss = model(imgs[j * n:j * n + n].to(device), targets_j, requestPrecision=True, epoch=epoch)
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+            # Compute loss, compute gradient, update parameters
+            loss = model(imgs.to(device), targets, requestPrecision=True)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-                ui += 1
-                metrics += model.losses['metrics']
-                for key, val in model.losses.items():
-                    rloss[key] = (rloss[key] * ui + val) / (ui + 1)
+            # Compute running epoch-means of tracked metrics
+            ui += 1
+            metrics += model.losses['metrics']
+            for key, val in model.losses.items():
+                rloss[key] = (rloss[key] * ui + val) / (ui + 1)
 
-                # Precision
-                precision = metrics[0] / (metrics[0] + metrics[1] + 1e-16)
-                k = (metrics[0] + metrics[1]) > 0
-                if k.sum() > 0:
-                    mean_precision = precision[k].mean()
-                else:
-                    mean_precision = 0
+            # Precision
+            precision = metrics[0] / (metrics[0] + metrics[1] + 1e-16)
+            k = (metrics[0] + metrics[1]) > 0
+            if k.sum() > 0:
+                mean_precision = precision[k].mean()
+            else:
+                mean_precision = 0
 
-                # Recall
-                recall = metrics[0] / (metrics[0] + metrics[2] + 1e-16)
-                k = (metrics[0] + metrics[2]) > 0
-                if k.sum() > 0:
-                    mean_recall = recall[k].mean()
-                else:
-                    mean_recall = 0
+            # Recall
+            recall = metrics[0] / (metrics[0] + metrics[2] + 1e-16)
+            k = (metrics[0] + metrics[2]) > 0
+            if k.sum() > 0:
+                mean_recall = recall[k].mean()
+            else:
+                mean_recall = 0
 
-                s = ('%10s%10s' + '%10.3g' * 14) % (
-                    '%g/%g' % (epoch, opt.epochs - 1), '%g/%g' % (i, len(dataloader) - 1), rloss['x'],
-                    rloss['y'], rloss['w'], rloss['h'], rloss['conf'], rloss['cls'],
-                    rloss['loss'], mean_precision, mean_recall, model.losses['nGT'], model.losses['TP'],
-                    model.losses['FP'], model.losses['FN'], time.time() - t1)
-                t1 = time.time()
-                print(s)
-
-            # if i == 1:
-            #    return
+            s = ('%10s%10s' + '%10.3g' * 14) % (
+                '%g/%g' % (epoch, opt.epochs - 1), '%g/%g' % (i, len(dataloader) - 1), rloss['x'],
+                rloss['y'], rloss['w'], rloss['h'], rloss['conf'], rloss['cls'],
+                rloss['loss'], mean_precision, mean_recall, model.losses['nT'], model.losses['TP'],
+                model.losses['FP'], model.losses['FN'], time.time() - t1)
+            t1 = time.time()
+            print(s)
 
         # Write epoch results
         with open('results.txt', 'a') as file:
             file.write(s + '\n')
 
         # Update best loss
-        loss_per_target = rloss['loss'] / rloss['nGT']
+        loss_per_target = rloss['loss'] / rloss['nT']
         if loss_per_target < best_loss:
             best_loss = loss_per_target
 

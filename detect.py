@@ -18,8 +18,8 @@ parser.add_argument('-txt_out', type=bool, default=False)
 
 parser.add_argument('-cfg', type=str, default='cfg/yolov3.cfg', help='cfg file path')
 parser.add_argument('-class_path', type=str, default='data/coco.names', help='path to class label file')
-parser.add_argument('-conf_thres', type=float, default=0.8, help='object confidence threshold')
-parser.add_argument('-nms_thres', type=float, default=0.5, help='iou threshold for non-maximum suppression')
+parser.add_argument('-conf_thres', type=float, default=0.50, help='object confidence threshold')
+parser.add_argument('-nms_thres', type=float, default=0.45, help='iou threshold for non-maximum suppression')
 parser.add_argument('-batch_size', type=int, default=1, help='size of the batches')
 parser.add_argument('-img_size', type=int, default=32 * 13, help='size of each image dimension')
 opt = parser.parse_args()
@@ -33,7 +33,7 @@ def detect(opt):
     # Load model
     model = Darknet(opt.cfg, opt.img_size)
 
-    weights_path = 'checkpoints/yolov3.weights'
+    weights_path = 'checkpoints/yolov3.pt'
     if weights_path.endswith('.weights'):  # saved in darknet format
         load_weights(model, weights_path)
     else:  # endswith('.pt'), saved in pytorch format
@@ -56,30 +56,24 @@ def detect(opt):
 
     # Set Dataloader
     classes = load_classes(opt.class_path)  # Extracts class labels from file
-    dataloader = ImageFolder(opt.image_folder, batch_size=opt.batch_size, img_size=opt.img_size)
+    dataloader = load_images(opt.image_folder, batch_size=opt.batch_size, img_size=opt.img_size)
 
     imgs = []  # Stores image paths
     img_detections = []  # Stores detections for each image index
     prev_time = time.time()
-    detections = None
     for batch_i, (img_paths, img) in enumerate(dataloader):
         print(batch_i, img.shape, end=' ')
-        preds = []
 
         # Get detections
         with torch.no_grad():
-            # Normal orientation
             chip = torch.from_numpy(img).unsqueeze(0).to(device)
             pred = model(chip)
             pred = pred[pred[:, :, 4] > opt.conf_thres]
 
             if len(pred) > 0:
-                preds.append(pred.unsqueeze(0))
-
-        if len(preds) > 0:
-            detections = non_max_suppression(torch.cat(preds, 1), opt.conf_thres, opt.nms_thres)
-            img_detections.extend(detections)
-            imgs.extend(img_paths)
+                detections = non_max_suppression(pred.unsqueeze(0), opt.conf_thres, opt.nms_thres)
+                img_detections.extend(detections)
+                imgs.extend(img_paths)
 
         print('Batch %d... (Done %.3fs)' % (batch_i, time.time() - prev_time))
         prev_time = time.time()
@@ -136,9 +130,9 @@ def detect(opt):
 
                 if opt.plot_flag:
                     # Add the bbox to the plot
-                    label = '%s %.2f' % (classes[int(cls_pred)], cls_conf) if cls_conf > 0.05 else None
+                    label = '%s %.2f' % (classes[int(cls_pred)], conf)
                     color = bbox_colors[int(np.where(unique_classes == int(cls_pred))[0])]
-                    plot_one_box([x1, y1, x2, y2], img, label=label, color=color, line_thickness=3)
+                    plot_one_box([x1, y1, x2, y2], img, label=label, color=color)
 
         if opt.plot_flag:
             # Save generated image with detections
